@@ -243,26 +243,30 @@ with right:
     # Lógica de temporizador
     # -----------------------------
     def tick():
-        """Actualiza el temporizador si está en marcha (1 segundo por ciclo)."""
         if not p["is_running"]:
             return
         now = time.time()
         if p["last_tick"] is None:
             p["last_tick"] = now
             return
-        elapsed = now - p["last_tick"]
-        if elapsed >= 1:
-            # Descontamos segundos enteros para ser estables
-            dec = int(elapsed)
+        dec = int(now - p["last_tick"])
+        if dec >= 1:
             p["remaining"] = max(0, p["remaining"] - dec)
             p["last_tick"] = now
+    
+    # Llamamos a tick() y, si sigue en marcha, forzamos un rerender limpio
+    tick()
+if p["is_running"]:
+    # Cuando queda 0, cerramos el ciclo antes de relanzar
+    if p["remaining"] <= 0:
+        on_timer_complete()
+    # Reejecuta el script para “animar” el cronómetro
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        # compat con versiones antiguas
+        st.experimental_rerun()
 
-    # Actualizar cada segundo cuando está en marcha
-    if p["is_running"]:
-        st.experimental_rerun  # noqa: only to hint linter
-        st.autorefresh = st.experimental_get_query_params  # silence linter (compat)
-        st.experimental_set_query_params(_=int(time.time()))  # fuerza un rerun cada segundo
-        tick()
 
     # Al finalizar el conteo
     def on_timer_complete():
