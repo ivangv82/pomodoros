@@ -1,379 +1,349 @@
-import time
-from datetime import datetime, timedelta, date
-from typing import Optional
+# app.py
+# =========================================
+# Gestor de Tareas + Temporizador Pomodoro
+# Autor: Formación en Bolsa (Iván)
+# Requisitos mínimos:
+#   streamlit>=1.25.0
+#   pandas>=1.5.0
+# =========================================
 
+import time
+import math
+import uuid
 import pandas as pd
 import streamlit as st
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Boolean, Date, DateTime
+
+# -----------------------------
+# Configuración general página
+# -----------------------------
+st.set_page_config(
+    page_title="Gestor de tiempo | Formación en Bolsa",
+    page_icon="⏳",
+    layout="wide"
 )
-from sqlalchemy.orm import declarative_base, sessionmaker
 
-# ─────────────────────────────────────────────────────────────
-# Configuración básica
-# ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Productividad: Tareas + Pomodoro", page_icon="⏱️", layout="wide")
-DB_URL = "sqlite:///tasks.db"  # fichero local
-
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-# ─────────────────────────────────────────────────────────────
-# Modelo de datos
-# ─────────────────────────────────────────────────────────────
-class Task(Base):
-    __tablename__ = "tasks"
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False)
-    priority = Column(String, default="Media")  # Baja/Media/Alta
-    category = Column(String, default="General")
-    pomodoros_est = Column(Integer, default=1)
-    pomodoros_done = Column(Integer, default=0)
-    is_done = Column(Boolean, default=False)
-    is_today = Column(Boolean, default=False)  # marcar para la vista del día
-    due_date = Column(Date, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-Base.metadata.create_all(bind=engine)
-
-
-# ─────────────────────────────────────────────────────────────
-# Utilidades DB
-# ─────────────────────────────────────────────────────────────
-CATEGORIES = [
-    "Bolsa Academy", "Turbo Bolsa", "Marketing", "Youtube",
-    "Instagram", "Blog", "Web"
-]
-PRIORITIES = ["Baja", "Media", "Alta"]
-
-
-def get_session():
-    return SessionLocal()
-
-
-def add_task(title, priority, category, pom_est, due_date, is_today):
-    with get_session() as db:
-        t = Task(
-            title=title.strip(),
-            priority=priority,
-            category=category,
-            pomodoros_est=max(int(pom_est), 0),
-            due_date=due_date,
-            is_today=is_today,
-        )
-        db.add(t)
-        db.commit()
-
-
-def update_task(task: Task, **kwargs):
-    with get_session() as db:
-        db.merge(task)  # asegura instancia gestionada
-        for k, v in kwargs.items():
-            setattr(task, k, v)
-        db.commit()
-
-
-def delete_task(task_id: int):
-    with get_session() as db:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task:
-            db.delete(task)
-            db.commit()
-
-
-def list_tasks(filters: Optional[dict] = None) -> list[Task]:
-    with get_session() as db:
-        q = db.query(Task)
-        if filters:
-            if "only_today" in filters and filters["only_today"]:
-                q = q.filter(Task.is_today.is_(True), Task.is_done.is_(False))
-            if "category" in filters and filters["category"] != "Todas":
-                q = q.filter(Task.category == filters["category"])
-            if "priority" in filters and filters["priority"] != "Todas":
-                q = q.filter(Task.priority == filters["priority"])
-            if "status" in filters:
-                if filters["status"] == "Pendientes":
-                    q = q.filter(Task.is_done.is_(False))
-                elif filters["status"] == "Hechas":
-                    q = q.filter(Task.is_done.is_(True))
-        return q.order_by(Task.is_done.asc(), Task.priority.desc(), Task.created_at.asc()).all()
-
-
-def tasks_dataframe(tasks: list[Task]) -> pd.DataFrame:
-    rows = []
-    for t in tasks:
-        rows.append({
-            "ID": t.id,
-            "Tarea": t.title,
-            "Prioridad": t.priority,
-            "Categoría": t.category,
-            "⏱️ Pom. hechos/estimados": f"{t.pomodoros_done}/{t.pomodoros_est}",
-            "Para hoy": "Sí" if t.is_today else "No",
-            "Fecha límite": t.due_date.strftime("%Y-%m-%d") if t.due_date else "",
-            "Estado": "Hecha" if t.is_done else "Pendiente",
-        })
-    return pd.DataFrame(rows)
-
-
-# ─────────────────────────────────────────────────────────────
-# Estado de la app (Pomodoro)
-# ─────────────────────────────────────────────────────────────
+# -----------------------------
+# Helpers de sesión (estado)
+# -----------------------------
 def init_state():
-    ss = st.session_state
-    ss.setdefault("timer_mode", "focus")  # focus / short / long
-    ss.setdefault("focus_minutes", 25)
-    ss.setdefault("short_minutes", 5)
-    ss.setdefault("long_minutes", 15)
-    ss.setdefault("is_running", False)
-    ss.setdefault("end_time", None)
-    ss.setdefault("selected_task_id", None)
-    ss.setdefault("completed_pomodoros_counter", 0)  # para sesión
-    ss.setdefault("last_tick", time.time())
+    # Lista de tareas
+    if "tasks" not in st.session_state:
+        st.session_state.tasks = []  # cada tarea: dict (id, titulo, prioridad, categoria, pomos_est, pomos_done, hoy, done)
 
+    # Filtros
+    if "filters" not in st.session_state:
+        st.session_state.filters = {"categoria": "Todas", "prioridad": "Todas", "solo_hoy": False, "solo_pendientes": False}
+
+    # Pomodoro
+    if "pomodoro" not in st.session_state:
+        st.session_state.pomodoro = {
+            "mode": "Pomodoro",          # Pomodoro | Descanso corto | Descanso largo
+            "durations": {               # minutos por modo
+                "Pomodoro": 25,
+                "Descanso corto": 5,
+                "Descanso largo": 15
+            },
+            "long_break_every": 4,       # cada 4 pomodoros → descanso largo
+            "cycles_done": 0,            # pomodoros terminados en el día
+            "is_running": False,
+            "remaining": 25 * 60,        # segundos
+            "last_tick": None,
+            "active_task_id": None       # tarea seleccionada para sumar pomodoros
+        }
 
 init_state()
 
+CATEGORIAS = ["Bolsa Academy", "Turbo Bolsa", "Marketing", "Youtube", "Instagram", "Blog", "Web"]
+PRIORIDADES = ["Alta", "Media", "Baja"]
 
-def minutes_for_mode(mode: str) -> int:
-    if mode == "focus":
-        return int(st.session_state.focus_minutes)
-    if mode == "short":
-        return int(st.session_state.short_minutes)
-    return int(st.session_state.long_minutes)
+# -----------------------------
+# Barra superior — título
+# -----------------------------
+st.title("⏳ Gestor de Tareas + Pomodoros")
+st.caption("Planifica tu día, prioriza tareas y trabaja en ciclos de foco con descansos. Estilo Formación en Bolsa.")
 
+# =============================
+# COLUMNA IZQ: TAREAS
+# COLUMNA DCHA: POMODORO
+# =============================
+left, right = st.columns([1.2, 1])
 
-def start_timer():
-    mins = minutes_for_mode(st.session_state.timer_mode)
-    st.session_state.end_time = datetime.utcnow() + timedelta(minutes=mins)
-    st.session_state.is_running = True
+# ----------------------------------------
+# IZQUIERDA — Gestión de tareas
+# ----------------------------------------
+with left:
+    st.subheader("📋 Tareas")
 
+    with st.expander("➕ Añadir nueva tarea", expanded=True):
+        with st.form("form_add_task", clear_on_submit=True):
+            col_a, col_b = st.columns([2, 1])
+            titulo = col_a.text_input("Título de la tarea", placeholder="Ej. Preparar mentoría")
+            prioridad = col_b.selectbox("Prioridad", PRIORIDADES, index=1)
+            col_c, col_d, col_e = st.columns([1.2, 1, 1])
+            categoria = col_c.selectbox("Categoría", CATEGORIAS, index=0)
+            pomos_est = col_d.number_input("Pomodoros estimados", min_value=1, max_value=20, value=1, step=1)
+            para_hoy = col_e.checkbox("Para hoy", value=True)
+            submitted = st.form_submit_button("Añadir tarea")
 
-def stop_timer():
-    st.session_state.is_running = False
-    st.session_state.end_time = None
+        if submitted:
+            if titulo.strip():
+                st.session_state.tasks.append({
+                    "id": str(uuid.uuid4()),
+                    "titulo": titulo.strip(),
+                    "prioridad": prioridad,
+                    "categoria": categoria,
+                    "pomos_est": int(pomos_est),
+                    "pomos_done": 0,
+                    "hoy": bool(para_hoy),
+                    "done": False,
+                })
+                st.success("Tarea añadida ✅")
+            else:
+                st.warning("Escribe un título para la tarea.")
 
+    # ---- Filtros ----
+    col_f1, col_f2, col_f3, col_f4 = st.columns([1, 1, 1, 1])
+    st.session_state.filters["categoria"] = col_f1.selectbox("Filtrar por categoría", ["Todas"] + CATEGORIAS, index=0)
+    st.session_state.filters["prioridad"] = col_f2.selectbox("Filtrar por prioridad", ["Todas"] + PRIORIDADES, index=0)
+    st.session_state.filters["solo_hoy"] = col_f3.checkbox("Solo hoy")
+    st.session_state.filters["solo_pendientes"] = col_f4.checkbox("Solo pendientes")
 
-def reset_timer():
-    stop_timer()
+    # ---- Preparar DataFrame para mostrar/editar ----
+    def apply_filters(rows):
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
+        mask = pd.Series([True] * len(df))
+        f = st.session_state.filters
+        if f["categoria"] != "Todas":
+            mask &= (df["categoria"] == f["categoria"])
+        if f["prioridad"] != "Todas":
+            mask &= (df["prioridad"] == f["prioridad"])
+        if f["solo_hoy"]:
+            mask &= (df["hoy"] == True)
+        if f["solo_pendientes"]:
+            mask &= (df["done"] == False)
+        return df[mask]
 
+    df_view = apply_filters(st.session_state.tasks)
 
-def remaining_seconds() -> int:
-    if not st.session_state.is_running or not st.session_state.end_time:
-        return minutes_for_mode(st.session_state.timer_mode) * 60
-    delta = st.session_state.end_time - datetime.utcnow()
-    return max(int(delta.total_seconds()), 0)
-
-
-def fmt_time(seconds: int) -> str:
-    m, s = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
-
-
-# ─────────────────────────────────────────────────────────────
-# UI: Cabecera
-# ─────────────────────────────────────────────────────────────
-st.markdown(
-    "<h2 style='margin-bottom:0'>⏱️ Productividad: Tareas + Pomodoro</h2>"
-    "<p style='margin-top:2px;color:#999'>Gestor simple con prioridades, categorías y temporizador Pomodoro.</p>",
-    unsafe_allow_html=True
-)
-
-tabs = st.tabs(["✅ Tareas", "🍅 Pomodoro"])
-
-
-# ─────────────────────────────────────────────────────────────
-# Pestaña 1: TAREAS
-# ─────────────────────────────────────────────────────────────
-with tabs[0]:
-    st.subheader("Añadir tarea")
-    c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1.6, 1.2, 1.2])
-
-    with c1:
-        title = st.text_input("Título", placeholder="Ej: Preparar mentoría de TurboBolsa")
-    with c2:
-        priority = st.selectbox("Prioridad", PRIORITIES, index=1)
-    with c3:
-        category = st.selectbox("Categoría", ["General"] + CATEGORIES)
-    with c4:
-        pom_est = st.number_input("Pomodoros (estimación)", min_value=0, max_value=20, value=1)
-    with c5:
-        due = st.date_input("Fecha límite (opcional)", value=None)
-
-    col_t1, col_t2 = st.columns([1, 3])
-    with col_t1:
-        is_today = st.checkbox("Añadir a Hoy", value=True)
-    with col_t2:
-        if st.button("➕ Añadir tarea", type="primary", use_container_width=True, disabled=not title.strip()):
-            add_task(title, priority, category, pom_est, due if due else None, is_today)
-            st.success("Tarea creada.")
-            st.rerun()
-
-    st.divider()
-    st.subheader("Listado y filtros")
-
-    fc1, fc2, fc3, fc4 = st.columns([1.4, 1.4, 1.2, 1.2])
-    with fc1:
-        f_category = st.selectbox("Filtrar por categoría", ["Todas"] + CATEGORIES)
-    with fc2:
-        f_priority = st.selectbox("Filtrar por prioridad", ["Todas"] + PRIORITIES)
-    with fc3:
-        f_status = st.selectbox("Estado", ["Pendientes", "Hechas", "Todas"])
-    with fc4:
-        only_today = st.checkbox("Solo 'Hoy'", value=False)
-
-    filters = {
-        "category": f_category,
-        "priority": f_priority,
-        "status": f_status,
-        "only_today": only_today
-    }
-    tasks = list_tasks(filters)
-
-    df = tasks_dataframe(tasks)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.caption("Consejo: marca tareas para Hoy y así aparecerán directas en la pestaña Pomodoro.")
-
-    st.subheader("Acciones rápidas")
-    if tasks:
-        for t in tasks:
-            with st.expander(f"[{t.id}] {t.title}", expanded=False):
-                cA, cB, cC, cD, cE, cF = st.columns([3, 1, 1, 1, 1, 1.2])
-                with cA:
-                    new_title = st.text_input("Título", value=t.title, key=f"title_{t.id}")
-                with cB:
-                    new_priority = st.selectbox("Prioridad", PRIORITIES, index=PRIORITIES.index(t.priority), key=f"prio_{t.id}")
-                with cC:
-                    new_category = st.selectbox("Categoría", ["General"] + CATEGORIES,
-                                                index=(["General"] + CATEGORIES).index(t.category),
-                                                key=f"cat_{t.id}")
-                with cD:
-                    new_est = st.number_input("Pom. estimados", min_value=0, max_value=20, value=int(t.pomodoros_est), key=f"est_{t.id}")
-                with cE:
-                    new_today = st.checkbox("Para hoy", value=bool(t.is_today), key=f"today_{t.id}")
-                with cF:
-                    new_due = st.date_input("Fecha límite", value=t.due_date, key=f"due_{t.id}")
-
-                c1x, c2x, c3x, c4x = st.columns([1, 1, 1, 1])
-                with c1x:
-                    if st.button("💾 Guardar", key=f"save_{t.id}"):
-                        t.title = new_title.strip()
-                        t.priority = new_priority
-                        t.category = new_category
-                        t.pomodoros_est = int(new_est)
-                        t.is_today = bool(new_today)
-                        t.due_date = new_due
-                        update_task(t)
-                        st.success("Guardado.")
-                        st.rerun()
-                with c2x:
-                    if st.button(("✅ Marcar hecha" if not t.is_done else "↩️ Marcar pendiente"), key=f"done_{t.id}"):
-                        t.is_done = not t.is_done
-                        update_task(t)
-                        st.rerun()
-                with c3x:
-                    if st.button("➕ +1 Pomodoro", key=f"plus_{t.id}"):
-                        t.pomodoros_done = int(t.pomodoros_done) + 1
-                        update_task(t)
-                        st.rerun()
-                with c4x:
-                    if st.button("🗑️ Borrar", key=f"del_{t.id}"):
-                        delete_task(t.id)
-                        st.rerun()
+    if df_view.empty:
+        st.info("No hay tareas para mostrar con los filtros actuales.")
     else:
-        st.info("No hay tareas con esos filtros.")
+        # Orden visual: primero hoy, luego prioridad Alta>Media>Baja, luego no hechas
+        prioridad_order = {"Alta": 0, "Media": 1, "Baja": 2}
+        df_view = df_view.sort_values(
+            by=["hoy", "prioridad", "done", "pomos_done"],
+            ascending=[False, True, True, True],
+            key=lambda s: s.map(prioridad_order) if s.name == "prioridad" else s
+        )
 
-    st.download_button(
-        "⬇️ Exportar tareas a CSV",
-        tasks_dataframe(list_tasks({"status": "Todas"})).to_csv(index=False).encode("utf-8"),
-        "tareas.csv",
-        "text/csv",
-        use_container_width=True
+        # Editor en línea
+        edited = st.data_editor(
+            df_view[["titulo", "prioridad", "categoria", "pomos_est", "pomos_done", "hoy", "done"]],
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "titulo": st.column_config.TextColumn("Título", width="medium"),
+                "prioridad": st.column_config.SelectboxColumn("Prioridad", options=PRIORIDADES),
+                "categoria": st.column_config.SelectboxColumn("Categoría", options=CATEGORIAS),
+                "pomos_est": st.column_config.NumberColumn("Pomodoros (est.)", min_value=1, max_value=20, step=1),
+                "pomos_done": st.column_config.NumberColumn("Pomodoros hechos", min_value=0, max_value=100, step=1),
+                "hoy": st.column_config.CheckboxColumn("Hoy"),
+                "done": st.column_config.CheckboxColumn("Hecha"),
+            },
+            key="editor_tareas"
+        )
+
+        # Aplicar cambios del editor a la lista real (por id)
+        # Hacemos merge por posición visible (índices alineados con df_view)
+        for idx, (_, row) in enumerate(edited.iterrows()):
+            real_idx = df_view.index[idx]  # índice dentro de la lista original
+            t = st.session_state.tasks[real_idx]
+            t["titulo"] = row["titulo"]
+            t["prioridad"] = row["prioridad"]
+            t["categoria"] = row["categoria"]
+            t["pomos_est"] = int(row["pomos_est"])
+            t["pomos_done"] = int(row["pomos_done"])
+            t["hoy"] = bool(row["hoy"])
+            t["done"] = bool(row["done"])
+
+    # Acciones rápidas
+    col_actions_1, col_actions_2, col_actions_3 = st.columns([1, 1, 1])
+    if col_actions_1.button("🧹 Borrar tareas hechas"):
+        before = len(st.session_state.tasks)
+        st.session_state.tasks = [t for t in st.session_state.tasks if not t["done"]]
+        st.success(f"Eliminadas {before - len(st.session_state.tasks)} tareas completadas.")
+
+    if col_actions_2.button("✅ Marcar 'Hoy' las tareas de prioridad Alta"):
+        for t in st.session_state.tasks:
+            if t["prioridad"] == "Alta":
+                t["hoy"] = True
+        st.toast("Tareas Alta → Hoy ✅")
+
+    if col_actions_3.button("🔄 Reset pomodoros hechos (todas)"):
+        for t in st.session_state.tasks:
+            t["pomos_done"] = 0
+            t["done"] = False
+        st.toast("Contadores de pomodoros reiniciados.")
+
+
+# ----------------------------------------
+# DERECHA — Temporizador Pomodoro
+# ----------------------------------------
+with right:
+    st.subheader("⏱️ Pomodoro")
+
+    p = st.session_state.pomodoro
+
+    # Seleccionar tarea activa (solo las marcadas para hoy y no hechas)
+    opciones = [(t["titulo"], t["id"]) for t in st.session_state.tasks if t["hoy"] and not t["done"]]
+    if not opciones:
+        st.info("Marca alguna tarea como **Hoy** para poder seleccionarla aquí.")
+        p["active_task_id"] = None
+    else:
+        nombres = [op[0] for op in opciones]
+        ids = [op[1] for op in opciones]
+        sel = st.selectbox("Tarea activa (sumará pomodoros al completar un ciclo de foco)", nombres)
+        p["active_task_id"] = ids[nombres.index(sel)]
+
+    # Configuración rápida de tiempos
+    with st.expander("⚙️ Duraciones y opciones", expanded=False):
+        col_d1, col_d2, col_d3 = st.columns(3)
+        pom_min = col_d1.number_input("Pomodoro (min)", min_value=1, max_value=120, value=p["durations"]["Pomodoro"], step=1)
+        sb_min = col_d2.number_input("Descanso corto (min)", min_value=1, max_value=60, value=p["durations"]["Descanso corto"], step=1)
+        lb_min = col_d3.number_input("Descanso largo (min)", min_value=1, max_value=90, value=p["durations"]["Descanso largo"], step=1)
+        every = st.number_input("Descanso largo cada N pomodoros", min_value=1, max_value=10, value=p["long_break_every"], step=1)
+        if st.button("Guardar ajustes de tiempo"):
+            p["durations"]["Pomodoro"] = int(pom_min)
+            p["durations"]["Descanso corto"] = int(sb_min)
+            p["durations"]["Descanso largo"] = int(lb_min)
+            p["long_break_every"] = int(every)
+            # Si cambiamos tiempos, actualizamos remaining del modo actual
+            p["remaining"] = p["durations"][p["mode"]] * 60
+            st.success("Duraciones actualizadas.")
+
+    # Botones de modo (como pestañas simples)
+    col_m1, col_m2, col_m3 = st.columns(3)
+    def set_mode(new_mode: str):
+        p["mode"] = new_mode
+        p["is_running"] = False
+        p["remaining"] = p["durations"][new_mode] * 60
+        p["last_tick"] = None
+
+    if col_m1.button("Pomodoro", type="secondary"):
+        set_mode("Pomodoro")
+    if col_m2.button("Descanso corto", type="secondary"):
+        set_mode("Descanso corto")
+    if col_m3.button("Descanso largo", type="secondary"):
+        set_mode("Descanso largo")
+
+    # -----------------------------
+    # Lógica de temporizador
+    # -----------------------------
+    def tick():
+        """Actualiza el temporizador si está en marcha (1 segundo por ciclo)."""
+        if not p["is_running"]:
+            return
+        now = time.time()
+        if p["last_tick"] is None:
+            p["last_tick"] = now
+            return
+        elapsed = now - p["last_tick"]
+        if elapsed >= 1:
+            # Descontamos segundos enteros para ser estables
+            dec = int(elapsed)
+            p["remaining"] = max(0, p["remaining"] - dec)
+            p["last_tick"] = now
+
+    # Actualizar cada segundo cuando está en marcha
+    if p["is_running"]:
+        st.experimental_rerun  # noqa: only to hint linter
+        st.autorefresh = st.experimental_get_query_params  # silence linter (compat)
+        st.experimental_set_query_params(_=int(time.time()))  # fuerza un rerun cada segundo
+        tick()
+
+    # Al finalizar el conteo
+    def on_timer_complete():
+        p["is_running"] = False
+        p["last_tick"] = None
+        # Si terminó un pomodoro de foco, sumamos 1 a la tarea activa
+        if p["mode"] == "Pomodoro" and p["active_task_id"] is not None:
+            for t in st.session_state.tasks:
+                if t["id"] == p["active_task_id"]:
+                    t["pomos_done"] += 1
+                    # marcar hecha si alcanza estimación
+                    if t["pomos_done"] >= t["pomos_est"]:
+                        t["done"] = True
+                    break
+            p["cycles_done"] += 1
+            st.balloons()
+            st.toast("🎉 ¡Pomodoro completado! Suma 1 a la tarea activa.")
+
+            # Elegir descanso corto/largo
+            if p["cycles_done"] % p["long_break_every"] == 0:
+                set_mode("Descanso largo")
+            else:
+                set_mode("Descanso corto")
+        else:
+            # Si termina un descanso, volvemos a modo Pomodoro
+            set_mode("Pomodoro")
+        # No arrancamos automáticamente: que el usuario pulse Start
+
+    # Mostrar cronómetro
+    mins = p["remaining"] // 60
+    secs = p["remaining"] % 60
+    timer_str = f"{int(mins):02d}:{int(secs):02d}"
+
+    st.markdown(
+        f"""
+        <div style="text-align:center; font-size: 72px; font-weight:700; margin: 10px 0;">
+            {timer_str}
+        </div>
+        <p style="text-align:center; color:#888; margin-top:-10px;">Modo: <b>{p['mode']}</b></p>
+        """,
+        unsafe_allow_html=True
     )
 
+    # Barra de progreso
+    total_secs = p["durations"][p["mode"]] * 60
+    progress = 1.0 - (p["remaining"] / total_secs if total_secs else 0)
+    st.progress(progress)
 
-# ─────────────────────────────────────────────────────────────
-# Pestaña 2: POMODORO
-# ─────────────────────────────────────────────────────────────
-with tabs[1]:
-    st.subheader("Configuración (duraciones)")
-    sc1, sc2, sc3, sc4 = st.columns([1, 1, 1, 2])
-    with sc1:
-        st.number_input("Foco (min)", min_value=1, max_value=90, key="focus_minutes")
-    with sc2:
-        st.number_input("Descanso corto (min)", min_value=1, max_value=30, key="short_minutes")
-    with sc3:
-        st.number_input("Descanso largo (min)", min_value=1, max_value=60, key="long_minutes")
-    with sc4:
-        st.selectbox("Modo", options=[("Pomodoro (Foco)", "focus"),
-                                      ("Short Break", "short"),
-                                      ("Long Break", "long")],
-                     index={"focus":0, "short":1, "long":2}[st.session_state.timer_mode],
-                     key="mode_selector",
-                     format_func=lambda x: x[0])
-        # sincroniza el modo con el selectbox
-        st.session_state.timer_mode = st.session_state.mode_selector[1]
+    # Controles
+    col_c1, col_c2, col_c3 = st.columns(3)
+    if col_c1.button("▶️ Start"):
+        # Si estaba parado, arrancamos desde remaining actual
+        p["is_running"] = True
+        p["last_tick"] = None  # se fijará en tick()
+    if col_c2.button("⏸️ Pausa"):
+        p["is_running"] = False
+        p["last_tick"] = None
+    if col_c3.button("⏹️ Reset"):
+        p["is_running"] = False
+        p["remaining"] = p["durations"][p["mode"]] * 60
+        p["last_tick"] = None
 
-    st.divider()
-    left, right = st.columns([2, 1])
+    # Si llega a cero, gestionar fin
+    if p["remaining"] <= 0:
+        on_timer_complete()
 
-    with left:
-        # Selector de tarea del día
-        today_tasks = list_tasks({"only_today": True, "status": "Pendientes"})
-        options = [(t.id, f"[{t.priority}] {t.title}  ({t.pomodoros_done}/{t.pomodoros_est})") for t in today_tasks]
-        st.selectbox(
-            "Tarea del ciclo actual",
-            options=[(None, "— Sin tarea asignada —")] + options,
-            index=0 if st.session_state.selected_task_id is None else
-                  1 + next((i for i, (tid, _) in enumerate(options) if tid == st.session_state.selected_task_id), 0),
-            key="task_selector",
-            format_func=lambda x: x[1]
-        )
-        st.session_state.selected_task_id = st.session_state.task_selector[0]
+    # Info de ciclos
+    st.caption(f"Pomodoros completados hoy: **{p['cycles_done']}**")
 
-        # Timer
-        st.markdown("### ⏲️ Temporizador")
-        secs = remaining_seconds()
-        st.markdown(
-            f"<div style='font-size:72px;font-weight:700;text-align:center'>{fmt_time(secs)}</div>",
-            unsafe_allow_html=True
-        )
-        progress = 1 - secs / (minutes_for_mode(st.session_state.timer_mode) * 60)
-        st.progress(progress)
+# ----------------------------------------
+# Pie: Resumen rápido
+# ----------------------------------------
+st.markdown("---")
+col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+total = len(st.session_state.tasks)
+hechas = len([t for t in st.session_state.tasks if t["done"]])
+hoy = len([t for t in st.session_state.tasks if t["hoy"] and not t["done"]])
+pomos_tot = sum(t["pomos_done"] for t in st.session_state.tasks)
+col_s1.metric("Tareas totales", total)
+col_s2.metric("Completadas", hechas)
+col_s3.metric("Pendientes para hoy", hoy)
+col_s4.metric("Pomodoros hechos", pomos_tot)
 
-        cbt1, cbt2, cbt3 = st.columns(3)
-        with cbt1:
-            if st.button("▶️ Start", use_container_width=True):
-                start_timer()
-        with cbt2:
-            if st.button("⏸️ Stop", use_container_width=True):
-                stop_timer()
-        with cbt3:
-            if st.button("🔁 Reset", use_container_width=True):
-                reset_timer()
-
-        # Auto-refresh cada segundo si está corriendo
-        if st.session_state.is_running:
-            st.experimental_rerun() if remaining_seconds() == 0 else st.autorefresh(interval=1000, key="tick")
-
-        # Al terminar un ciclo:
-        if st.session_state.is_running and remaining_seconds() == 0:
-            stop_timer()
-            # sumar pomodoro a la tarea seleccionada si era foco
-            if st.session_state.timer_mode == "focus" and st.session_state.selected_task_id:
-                with get_session() as db:
-                    t = db.query(Task).filter(Task.id == st.session_state.selected_task_id).first()
-                    if t:
-                        t.pomodoros_done = int(t.pomodoros_done) + 1
-                        db.commit()
-            st.success("¡Tiempo completado!")
-            st.balloons()
-
-    with right
+st.caption("💡 Consejo: marca como **Hoy** lo crítico, usa **Alta** para priorizar y trabaja en bloques de 25' con descansos.")
