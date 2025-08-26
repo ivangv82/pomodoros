@@ -264,8 +264,8 @@ if p["is_running"]:
     if hasattr(st, "rerun"):
         st.rerun()
     else:
-        # compat con versiones antiguas
-        st.experimental_rerun()
+        
+        
 
 
     # Al finalizar el conteo
@@ -320,7 +320,7 @@ if p["is_running"]:
     if col_c1.button("▶️ Start"):
         # Si estaba parado, arrancamos desde remaining actual
         p["is_running"] = True
-        p["last_tick"] = None  # se fijará en tick()
+        p["last_tick"] = time.time()
     if col_c2.button("⏸️ Pausa"):
         p["is_running"] = False
         p["last_tick"] = None
